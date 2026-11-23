@@ -742,7 +742,6 @@ index cd86462..ca04c10 100644
          cancel => { root.cancel(); }
          import-srt => { root.import-srt(); }
 diff --git a/src/crates/concat/ui/editor.slint b/src/crates/concat/ui/editor.slint
-index fa463d7..7d5b9ae 100644
 --- a/src/crates/concat/ui/editor.slint
 +++ b/src/crates/concat/ui/editor.slint
 @@ -463,6 +463,8 @@ export global Editor {
@@ -755,7 +754,17 @@ index fa463d7..7d5b9ae 100644
      callback captions-cancel();
      callback captions-import-srt();
 diff --git a/src/crates/concat/ui/workspace/media-pane.slint b/src/crates/concat/ui/workspace/media-pane.slint
-index 08ec201..9b8a0f8 100644
+--- a/src/crates/concat/ui/workspace/media-pane.slint
++++ b/src/crates/concat/ui/workspace/media-pane.slint
+@@ -1660,5 +1660,7 @@ export component MediaPane inherits Rectangle {
+     callback captions-model-changed(index: int);
+     callback captions-language-changed(index: int);
+     callback captions-placement-changed(index: int);
+     callback captions-size-changed(index: int);
++    callback captions-minimum-words-changed(index: int);
++    callback captions-maximum-words-changed(index: int);
+     callback captions-begin();
+diff --git a/src/crates/concat/ui/workspace/media-pane.slint b/src/crates/concat/ui/workspace/media-pane.slint
 --- a/src/crates/concat/ui/workspace/media-pane.slint
 +++ b/src/crates/concat/ui/workspace/media-pane.slint
 @@ -2667,6 +2667,8 @@ export component MediaPane inherits Rectangle {
