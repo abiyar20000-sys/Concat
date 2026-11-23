@@ -776,3 +776,187 @@ diff --git a/src/crates/concat/ui/workspace/media-pane.slint b/src/crates/concat
                          begin => { root.captions-begin(); }
                          cancel => { root.captions-cancel(); }
                          import-srt => { root.captions-import-srt(); }
+diff --git a/src/crates/concat-speech/src/transcribe.rs b/src/crates/concat-speech/src/transcribe.rs
+--- a/src/crates/concat-speech/src/transcribe.rs
++++ b/src/crates/concat-speech/src/transcribe.rs
+@@ -584,6 +584,102 @@
+     if let Some(&(_, to)) = covered.next_back() {
+         last = to;
+     }
+     (start.max(first), end.min(last))
+ }
++/// Splits a Whisper caption across separate Silero speech spans. Whisper can
++/// return one line covering two utterances and the silence between them;
++/// keeping only the first start and last end makes the next subtitle appear
++/// during that silence. Each detected speech span becomes its own timed line.
++fn caption_segments_on_speech(
++    start: f64,
++    end: f64,
++    text: String,
++    speech: &[(f64, f64)],
++) -> Vec<Segment> {
++    const JOIN_GAP: f64 = 0.15;
++
++    if keep_segment(start, end, text.clone()).is_none() {
++        return Vec::new();
++    }
++
++    let mut spans: Vec<(f64, f64)> = speech
++        .iter()
++        .filter_map(|&(from, to)| {
++            let span = (start.max(from), end.min(to));
++            (span.0.is_finite() && span.1.is_finite() && span.1 > span.0)
++                .then_some(span)
++        })
++        .collect();
++    spans.sort_by(|left, right| left.0.total_cmp(&right.0));
++
++    // Ignore tiny detector breaks, but keep a real pause as an empty gap.
++    let mut joined: Vec<(f64, f64)> = Vec::with_capacity(spans.len());
++    for span in spans {
++        if let Some(last) = joined
++            .last_mut()
++            .filter(|last| span.0 - last.1 <= JOIN_GAP)
++        {
++            last.1 = last.1.max(span.1);
++        } else {
++            joined.push(span);
++        }
++    }
++
++    if joined.is_empty() {
++        return keep_segment(start, end, text).into_iter().collect();
++    }
++    if joined.len() == 1 {
++        let (from, to) = on_speech(start, end, speech);
++        return keep_segment(from, to, text).into_iter().collect();
++    }
++
++    let words: Vec<&str> = text.split_whitespace().collect();
++    if words.is_empty() {
++        return keep_segment(start, end, text).into_iter().collect();
++    }
++
++    // There cannot be more non-empty captions than words. If the detector
++    // found more spans, join the pair separated by the shortest pause.
++    while joined.len() > words.len() {
++        let nearest = (0..joined.len() - 1)
++            .min_by(|&left, &right| {
++                (joined[left + 1].0 - joined[left].1)
++                    .total_cmp(&(joined[right + 1].0 - joined[right].1))
++            })
++            .expect("at least two speech spans");
++        joined[nearest].1 = joined[nearest + 1].1;
++        joined.remove(nearest + 1);
++    }
++
++    let total_speech: f64 = joined.iter().map(|(from, to)| to - from).sum();
++    if !total_speech.is_finite() || total_speech <= f64::EPSILON {
++        return keep_segment(start, end, text).into_iter().collect();
++    }
++
++    // Whisper gives phrase timestamps, not exact word timestamps. Assign
++    // whole words to the detected spans in proportion to their speech time.
++    let mut output = Vec::with_capacity(joined.len());
++    let mut word_at = 0usize;
++    let mut elapsed = 0.0;
++    for (index, (from, to)) in joined.iter().copied().enumerate() {
++        elapsed += to - from;
++        let word_end = if index + 1 == joined.len() {
++            words.len()
++        } else {
++            let remaining_spans = joined.len() - index - 1;
++            let target = (elapsed / total_speech * words.len() as f64).round() as usize;
++            target.clamp(word_at + 1, words.len() - remaining_spans)
++        };
++        let caption = words[word_at..word_end].join(" ");
++        if caption.chars().any(char::is_alphanumeric) {
++            output.push(Segment {
++                start: from,
++                end: to,
++                text: caption,
++            });
++        }
++        word_at = word_end;
++    }
++    output
++}
+ /// What whisper hears of `samples`, and the speech its captions are timed
+@@ -1220,24 +1316,26 @@
+         if cancel.load(Ordering::Relaxed) {
+             return Err(Halt::Cancelled);
+         }
+-        let eot = context.token_eot();
+-        let lines = state.as_iter().filter_map(|segment| {
+-            if recipe.prune && made_up(&segment, eot) {
+-                log::debug!(
+-                    "transcribe: dropped as made up of silence: {:?}",
+-                    segment.to_str_lossy().unwrap_or_default()
+-                );
+-                return None;
+-            }
+-            // Whisper's timestamps are centiseconds, in what it heard.
+-            let start = reel.to_source(segment.start_timestamp() as f64 / 100.0);
+-            let end = reel.to_source(segment.end_timestamp() as f64 / 100.0);
+-            let (start, end) = on_speech(start, end, &speech);
+-            let mut text = segment.to_str_lossy().ok()?.trim().to_owned();
+-            if recipe.prune {
+-                text = unloop(&text);
+-            }
+-            keep_segment(start, end, text)
+-        });
+-        let lines: Vec<Segment> = lines.collect();
++        let eot = context.token_eot();
++        let lines = state.as_iter().flat_map(|segment| {
++            if recipe.prune && made_up(&segment, eot) {
++                log::debug!(
++                    "transcribe: dropped as made up of silence: {:?}",
++                    segment.to_str_lossy().unwrap_or_default()
++                );
++                return Vec::new();
++            }
++            // Whisper's timestamps are centiseconds, in what it heard.
++            let start = reel.to_source(segment.start_timestamp() as f64 / 100.0);
++            let end = reel.to_source(segment.end_timestamp() as f64 / 100.0);
++            let mut text = match segment.to_str_lossy() {
++                Ok(text) => text.trim().to_owned(),
++                Err(_) => return Vec::new(),
++            };
++            if recipe.prune {
++                text = unloop(&text);
++            }
++            caption_segments_on_speech(start, end, text, &speech)
++        });
++        let lines: Vec<Segment> = lines.collect();
+         Ok(if recipe.prune {
+@@ -1516,3 +1614,18 @@
+     }
++    #[test]
++    fn a_whisper_caption_is_split_at_detected_silences() {
++        let lines = caption_segments_on_speech(
++            0.0,
++            3.5,
++            "One two three four five".to_owned(),
++            &[(0.2, 0.9), (1.8, 3.2)],
++        );
++        assert_eq!(lines.len(), 2);
++        assert_eq!(lines[0].text, "One two");
++        assert_eq!(lines[1].text, "three four five");
++        assert_eq!((lines[0].start, lines[0].end), (0.2, 0.9));
++        assert_eq!((lines[1].start, lines[1].end), (1.8, 3.2));
++        assert!(lines[0].end < lines[1].start);
++    }
+     #[test]
+     fn stage_directions_and_degenerate_spans_are_not_captions() {
+diff --git a/src/crates/concat/src/panes/captions.rs b/src/crates/concat/src/panes/captions.rs
+--- a/src/crates/concat/src/panes/captions.rs
++++ b/src/crates/concat/src/panes/captions.rs
+@@ -859,7 +859,7 @@ fn word_range_segments(
+     segments: Vec<Segment>,
+     min_words: usize,
+     max_words: usize,
+ ) -> Vec<Segment> {
+-    const MAX_MERGE_GAP: f64 = 0.6;
++    const MAX_MERGE_GAP: f64 = 0.15;
+ 
+     let min_words = min_words.clamp(1, MAX_CAPTION_WORDS);
